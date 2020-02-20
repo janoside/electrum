@@ -143,7 +143,7 @@ class NetworkParameters(NamedTuple):
     protocol: str
     proxy: Optional[dict]
     auto_connect: bool
-    oneserver: bool = False
+    oneserver: bool = True
 
 
 proxy_modes = ['socks4', 'socks5']
@@ -572,7 +572,7 @@ class Network(Logger):
         except:
             return
         self.config.set_key('auto_connect', net_params.auto_connect, False)
-        self.config.set_key('oneserver', net_params.oneserver, False)
+        self.config.set_key('oneserver', net_params.oneserver, True)
         self.config.set_key('proxy', proxy_str, False)
         self.config.set_key('server', server_str, True)
         # abort if changes were not allowed by config
@@ -1127,7 +1127,7 @@ class Network(Logger):
         self.protocol = deserialize_server(self.default_server)[2]
         self.server_queue = queue.Queue()
         self._set_proxy(deserialize_proxy(self.config.get('proxy')))
-        self._set_oneserver(self.config.get('oneserver', False))
+        self._set_oneserver(self.config.get('oneserver', True))
         self._start_interface(self.default_server)
 
         async def main():

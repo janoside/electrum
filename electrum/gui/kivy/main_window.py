@@ -118,7 +118,7 @@ class ElectrumWindow(App):
     def toggle_auto_connect(self, x):
         self.auto_connect = not self.auto_connect
 
-    oneserver = BooleanProperty(False)
+    oneserver = BooleanProperty(True)
     def on_oneserver(self, instance, x):
         net_params = self.network.get_parameters()
         net_params = net_params._replace(oneserver=self.oneserver)
