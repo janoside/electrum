@@ -142,7 +142,7 @@ class NetworkParameters(NamedTuple):
     port: str
     protocol: str
     proxy: Optional[dict]
-    auto_connect: bool
+    auto_connect: bool = False
     oneserver: bool = True
 
 
