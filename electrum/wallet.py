@@ -44,7 +44,7 @@ from abc import ABC, abstractmethod
 import itertools
 
 from .i18n import _
-from .bip32 import BIP32Node
+from .bip32 import BIP32Node, convert_bip32_intpath_to_strpath, convert_bip32_path_to_list_of_uint32
 from .crypto import sha256
 from .util import (NotEnoughFunds, UserCancelled, profiler,
                    format_satoshis, format_fee_satoshis, NoDynamicFeeEstimates,
@@ -210,6 +210,7 @@ class TxWalletDetails(NamedTuple):
     fee: Optional[int]
     tx_mined_status: TxMinedInfo
     mempool_depth_bytes: Optional[int]
+    can_remove: bool  # whether user should be allowed to delete tx
 
 
 class Abstract_Wallet(AddressSynchronizer, ABC):
@@ -280,7 +281,12 @@ class Abstract_Wallet(AddressSynchronizer, ABC):
     def has_lightning(self):
         return bool(self.lnworker)
 
+    def can_have_lightning(self):
+        # we want static_remotekey to be a wallet address
+        return self.txin_type == 'p2wpkh'
+
     def init_lightning(self):
+        assert self.can_have_lightning()
         if self.db.get('lightning_privkey2'):
             return
         # TODO derive this deterministically from wallet.keystore at keystore generation time
@@ -437,6 +443,13 @@ class Abstract_Wallet(AddressSynchronizer, ABC):
         pass
 
     @abstractmethod
+    def get_address_path_str(self, address: str) -> Optional[str]:
+        """Returns derivation path str such as "m/0/5" to address,
+        or None if not applicable.
+        """
+        pass
+
+    @abstractmethod
     def get_redeem_script(self, address: str) -> Optional[str]:
         pass
 
@@ -449,7 +462,7 @@ class Abstract_Wallet(AddressSynchronizer, ABC):
         """Return script type of wallet address."""
         pass
 
-    def export_private_key(self, address, password) -> str:
+    def export_private_key(self, address: str, password: Optional[str]) -> str:
         if self.is_watching_only():
             raise Exception(_("This is a watching-only wallet"))
         if not is_address(address):
@@ -461,6 +474,9 @@ class Abstract_Wallet(AddressSynchronizer, ABC):
         txin_type = self.get_txin_type(address)
         serialized_privkey = bitcoin.serialize_privkey(pk, compressed, txin_type)
         return serialized_privkey
+
+    def export_private_key_for_path(self, path: Union[Sequence[int], str], password: Optional[str]) -> str:
+        raise Exception("this wallet is not deterministic")
 
     @abstractmethod
     def get_public_keys(self, address: str) -> Sequence[str]:
@@ -483,6 +499,11 @@ class Abstract_Wallet(AddressSynchronizer, ABC):
                              and (tx_we_already_have_in_db is None or not tx_we_already_have_in_db.is_complete()))
         label = ''
         tx_mined_status = self.get_tx_height(tx_hash)
+        can_remove = ((tx_mined_status.height in [TX_HEIGHT_FUTURE, TX_HEIGHT_LOCAL])
+                      # otherwise 'height' is unreliable (typically LOCAL):
+                      and is_relevant
+                      # don't offer during common signing flow, e.g. when watch-only wallet starts creating a tx:
+                      and bool(tx_we_already_have_in_db))
         if tx.is_complete():
             if tx_we_already_have_in_db:
                 label = self.get_label(tx_hash)
@@ -533,6 +554,7 @@ class Abstract_Wallet(AddressSynchronizer, ABC):
             fee=fee,
             tx_mined_status=tx_mined_status,
             mempool_depth_bytes=exp_n,
+            can_remove=can_remove,
         )
 
     def get_spendable_coins(self, domain, *, nonlocal_only=False) -> Sequence[PartialTxInput]:
@@ -662,6 +684,8 @@ class Abstract_Wallet(AddressSynchronizer, ABC):
             item['status'] = self.lnworker.get_invoice_status(key)
         else:
             return
+        # unique handle
+        item['key'] = key
         return item
 
     def _get_relevant_invoice_keys_for_tx(self, tx: Transaction) -> Set[str]:
@@ -744,6 +768,8 @@ class Abstract_Wallet(AddressSynchronizer, ABC):
             if txid and txid in transactions_tmp:
                 item = transactions_tmp[txid]
                 item['label'] = tx_item['label']
+                item['type'] = tx_item['type']
+                item['channel_id'] = tx_item['channel_id']
                 item['ln_value'] = Satoshis(ln_value)
             else:
                 tx_item['lightning'] = True
@@ -1168,7 +1194,9 @@ class Abstract_Wallet(AddressSynchronizer, ABC):
         return not self.is_watching_only() and hasattr(self.keystore, 'get_private_key')
 
     def address_is_old(self, address: str, *, req_conf: int = 3) -> bool:
-        """Returns whether address has any history that is deeply confirmed."""
+        """Returns whether address has any history that is deeply confirmed.
+        Used for reorg-safe(ish) gap limit roll-forward.
+        """
         max_conf = -1
         h = self.db.get_addr_history(address)
         needs_spv_check = not self.config.get("skipmerklecheck", False)
@@ -1861,7 +1889,7 @@ class Abstract_Wallet(AddressSynchronizer, ABC):
         pass
 
     @abstractmethod
-    def is_beyond_limit(self, address: str) -> bool:
+    def get_all_known_addresses_beyond_gap_limit(self) -> Set[str]:
         pass
 
 
@@ -1937,8 +1965,8 @@ class Imported_Wallet(Simple_Wallet):
     def is_change(self, address):
         return False
 
-    def is_beyond_limit(self, address):
-        return False
+    def get_all_known_addresses_beyond_gap_limit(self) -> Set[str]:
+        return set()
 
     def get_fingerprint(self):
         return ''
@@ -1978,7 +2006,7 @@ class Imported_Wallet(Simple_Wallet):
         else:
             raise BitcoinException(str(bad_addr[0][1]))
 
-    def delete_address(self, address):
+    def delete_address(self, address: str):
         if not self.db.has_imported_address(address):
             return
         transactions_to_remove = set()  # only referred to by this address
@@ -2023,6 +2051,9 @@ class Imported_Wallet(Simple_Wallet):
     def get_address_index(self, address) -> Optional[str]:
         # returns None if address is not mine
         return self.get_public_key(address)
+
+    def get_address_path_str(self, address):
+        return None
 
     def get_public_key(self, address) -> Optional[str]:
         x = self.db.get_imported_address(address)
@@ -2133,6 +2164,7 @@ class Deterministic_Wallet(Abstract_Wallet):
 
     def change_gap_limit(self, value):
         '''This method is not called in the code, it is kept for console use'''
+        value = int(value)
         if value >= self.min_acceptable_gap():
             self.gap_limit = value
             self.db.put('gap_limit', self.gap_limit)
@@ -2149,14 +2181,14 @@ class Deterministic_Wallet(Abstract_Wallet):
             k += 1
         return k
 
-    def min_acceptable_gap(self):
+    def min_acceptable_gap(self) -> int:
         # fixme: this assumes wallet is synchronized
         n = 0
         nmax = 0
         addresses = self.get_receiving_addresses()
         k = self.num_unused_trailing_addresses(addresses)
         for addr in addresses[0:-k]:
-            if self.db.get_addr_history(addr):
+            if self.address_is_old(addr):
                 n = 0
             else:
                 n += 1
@@ -2171,6 +2203,13 @@ class Deterministic_Wallet(Abstract_Wallet):
         for_change = int(for_change)
         pubkeys = self.derive_pubkeys(for_change, n)
         return self.pubkeys_to_address(pubkeys)
+
+    def export_private_key_for_path(self, path: Union[Sequence[int], str], password: Optional[str]) -> str:
+        if isinstance(path, str):
+            path = convert_bip32_path_to_list_of_uint32(path)
+        pk, compressed = self.keystore.get_private_key(path, password)
+        txin_type = self.get_txin_type()  # assumes no mixed-scripts in wallet
+        return bitcoin.serialize_privkey(pk, compressed, txin_type)
 
     def get_public_keys_with_deriv_info(self, address: str):
         der_suffix = self.get_address_index(address)
@@ -2226,24 +2265,32 @@ class Deterministic_Wallet(Abstract_Wallet):
             self.synchronize_sequence(False)
             self.synchronize_sequence(True)
 
-    def is_beyond_limit(self, address):
-        is_change, i = self.get_address_index(address)
-        limit = self.gap_limit_for_change if is_change else self.gap_limit
-        if i < limit:
-            return False
-        slice_start = max(0, i - limit)
-        slice_stop = max(0, i)
-        if is_change:
-            prev_addresses = self.get_change_addresses(slice_start=slice_start, slice_stop=slice_stop)
-        else:
-            prev_addresses = self.get_receiving_addresses(slice_start=slice_start, slice_stop=slice_stop)
-        for addr in prev_addresses:
-            if self.db.get_addr_history(addr):
-                return False
-        return True
+    def get_all_known_addresses_beyond_gap_limit(self):
+        # note that we don't stop at first large gap
+        found = set()
+
+        def process_addresses(addrs, gap_limit):
+            rolling_num_unused = 0
+            for addr in addrs:
+                if self.db.get_addr_history(addr):
+                    rolling_num_unused = 0
+                else:
+                    if rolling_num_unused >= gap_limit:
+                        found.add(addr)
+                    rolling_num_unused += 1
+
+        process_addresses(self.get_receiving_addresses(), self.gap_limit)
+        process_addresses(self.get_change_addresses(), self.gap_limit_for_change)
+        return found
 
     def get_address_index(self, address) -> Optional[Sequence[int]]:
         return self.db.get_address_index(address) or self._ephemeral_addr_to_addr_index.get(address)
+
+    def get_address_path_str(self, address):
+        intpath = self.get_address_index(address)
+        if intpath is None:
+            return None
+        return convert_bip32_intpath_to_strpath(intpath)
 
     def _learn_derivation_path_for_address_from_txinout(self, txinout, address):
         for ks in self.get_keystores():
@@ -2264,7 +2311,7 @@ class Deterministic_Wallet(Abstract_Wallet):
     def get_fingerprint(self):
         return self.get_master_public_key()
 
-    def get_txin_type(self, address):
+    def get_txin_type(self, address=None):
         return self.txin_type
 
 

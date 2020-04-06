@@ -37,11 +37,10 @@ from .bip32 import is_bip32_derivation, xpub_type, normalize_bip32_derivation, B
 from .keystore import bip44_derivation, purpose48_derivation, Hardware_KeyStore, KeyStore
 from .wallet import (Imported_Wallet, Standard_Wallet, Multisig_Wallet,
                      wallet_types, Wallet, Abstract_Wallet)
-from .storage import (WalletStorage, StorageEncryptionVersion,
-                      get_derivation_used_for_hw_device_encryption)
+from .storage import WalletStorage, StorageEncryptionVersion
 from .wallet_db import WalletDB
 from .i18n import _
-from .util import UserCancelled, InvalidPassword, WalletFileException
+from .util import UserCancelled, InvalidPassword, WalletFileException, UserFacingException
 from .simple_config import SimpleConfig
 from .plugin import Plugins, HardwarePluginLibraryUnavailable
 from .logging import Logger
@@ -114,18 +113,21 @@ class BaseWizard(Logger):
     def can_go_back(self):
         return len(self._stack) > 1
 
-    def go_back(self):
+    def go_back(self, *, rerun_previous: bool = True) -> None:
         if not self.can_go_back():
             return
         # pop 'current' frame
         self._stack.pop()
-        # pop 'previous' frame
-        stack_item = self._stack.pop()
+        prev_frame = self._stack[-1]
         # try to undo side effects since we last entered 'previous' frame
-        # FIXME only self.storage is properly restored
-        self.data = copy.deepcopy(stack_item.db_data)
-        # rerun 'previous' frame
-        self.run(stack_item.action, *stack_item.args, **stack_item.kwargs)
+        # FIXME only self.data is properly restored
+        self.data = copy.deepcopy(prev_frame.db_data)
+
+        if rerun_previous:
+            # pop 'previous' frame
+            self._stack.pop()
+            # rerun 'previous' frame
+            self.run(prev_frame.action, *prev_frame.args, **prev_frame.kwargs)
 
     def reset_stack(self):
         self._stack = []
@@ -145,7 +147,7 @@ class BaseWizard(Logger):
         self.choice_dialog(title=title, message=message, choices=choices, run_next=self.on_wallet_type)
 
     def upgrade_db(self, storage, db):
-        exc = None
+        exc = None  # type: Optional[Exception]
         def on_finished():
             if exc is None:
                 self.terminate(storage=storage, db=db)
@@ -158,6 +160,13 @@ class BaseWizard(Logger):
             except Exception as e:
                 exc = e
         self.waiting_dialog(do_upgrade, _('Upgrading wallet format...'), on_finished=on_finished)
+
+    def run_task_without_blocking_gui(self, task, *, msg: str = None) -> Any:
+        """Perform a task in a thread without blocking the GUI.
+        Returns the result of 'task', or raises the same exception.
+        This method blocks until 'task' is finished.
+        """
+        raise NotImplementedError()
 
     def load_2fa(self):
         self.data['wallet_type'] = '2fa'
@@ -333,8 +342,10 @@ class BaseWizard(Logger):
         self.choice_dialog(title=title, message=msg, choices=choices,
                            run_next=lambda *args: self.on_device(*args, purpose=purpose, storage=storage))
 
-    def on_device(self, name, device_info, *, purpose, storage=None):
-        self.plugin = self.plugins.get_plugin(name)  # type: HW_PluginBase
+    def on_device(self, name, device_info: 'DeviceInfo', *, purpose, storage=None):
+        self.plugin = self.plugins.get_plugin(name)
+        assert isinstance(self.plugin, HW_PluginBase)
+        devmgr = self.plugins.device_manager
         try:
             self.plugin.setup_device(device_info, self, purpose)
         except OSError as e:
@@ -342,7 +353,6 @@ class BaseWizard(Logger):
                             + '\n' + str(e) + '\n'
                             + _('To try to fix this, we will now re-pair with your device.') + '\n'
                             + _('Please try again.'))
-            devmgr = self.plugins.device_manager
             devmgr.unpair_id(device_info.device.id_)
             self.choose_hw_device(purpose, storage=storage)
             return
@@ -350,11 +360,14 @@ class BaseWizard(Logger):
             if self.question(e.text_ignore_old_fw_and_continue(), title=_("Outdated device firmware")):
                 self.plugin.set_ignore_outdated_fw()
                 # will need to re-pair
-                devmgr = self.plugins.device_manager
                 devmgr.unpair_id(device_info.device.id_)
             self.choose_hw_device(purpose, storage=storage)
             return
         except (UserCancelled, GoBack):
+            self.choose_hw_device(purpose, storage=storage)
+            return
+        except UserFacingException as e:
+            self.show_error(str(e))
             self.choose_hw_device(purpose, storage=storage)
             return
         except BaseException as e:
@@ -368,14 +381,12 @@ class BaseWizard(Logger):
                 self.run('on_hw_derivation', name, device_info, derivation, script_type)
             self.derivation_and_script_type_dialog(f)
         elif purpose == HWD_SETUP_DECRYPT_WALLET:
-            derivation = get_derivation_used_for_hw_device_encryption()
-            xpub = self.plugin.get_xpub(device_info.device.id_, derivation, 'standard', self)
-            password = keystore.Xpub.get_pubkey_from_xpub(xpub, ()).hex()
+            client = devmgr.client_by_id(device_info.device.id_)
+            password = client.get_password_for_storage_encryption()
             try:
                 storage.decrypt(password)
             except InvalidPassword:
                 # try to clear session so that user can type another passphrase
-                devmgr = self.plugins.device_manager
                 client = devmgr.client_by_id(device_info.device.id_)
                 if hasattr(client, 'clear_session'):  # FIXME not all hw wallet plugins have this
                     client.clear_session()
@@ -417,14 +428,16 @@ class BaseWizard(Logger):
                 self.show_error(e)
                 # let the user choose again
 
-    def on_hw_derivation(self, name, device_info, derivation, xtype):
+    def on_hw_derivation(self, name, device_info: 'DeviceInfo', derivation, xtype):
         from .keystore import hardware_keystore
         devmgr = self.plugins.device_manager
+        assert isinstance(self.plugin, HW_PluginBase)
         try:
             xpub = self.plugin.get_xpub(device_info.device.id_, derivation, xtype, self)
             client = devmgr.client_by_id(device_info.device.id_)
             if not client: raise Exception("failed to find client for device id")
             root_fingerprint = client.request_root_fingerprint_from_device()
+            label = client.label()  # use this as device_info.label might be outdated!
         except ScriptTypeNotSupported:
             raise  # this is handled in derivation_dialog
         except BaseException as e:
@@ -437,7 +450,7 @@ class BaseWizard(Logger):
             'derivation': derivation,
             'root_fingerprint': root_fingerprint,
             'xpub': xpub,
-            'label': device_info.label,
+            'label': label,
         }
         k = hardware_keystore(d)
         self.on_keystore(k)
@@ -538,6 +551,7 @@ class BaseWizard(Logger):
         if self.wallet_type == 'standard' and isinstance(self.keystores[0], Hardware_KeyStore):
             # offer encrypting with a pw derived from the hw device
             k = self.keystores[0]  # type: Hardware_KeyStore
+            assert isinstance(self.plugin, HW_PluginBase)
             try:
                 k.handler = self.plugin.create_handler(self)
                 password = k.get_password_for_storage_encryption()
